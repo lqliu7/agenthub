@@ -1,0 +1,399 @@
+#!/usr/bin/env node
+/**
+ * agenthub - AgentHub 本地终端连接工具（跨平台）
+ *
+ * 用法:
+ *   agenthub ls                        列出所有 session
+ *   agenthub attach <sessionId|name>   连接到指定 session（双向同步）
+ *   agenthub attach                    如果只有一个活跃 session，直接连接
+ *   agenthub log <sessionId|name>      tail -f session 的 log 文件
+ *
+ * 平台支持：Linux / macOS（Unix socket）/ Windows（Named pipe）
+ */
+
+const net  = require('net');
+const fs   = require('fs');
+const path = require('path');
+const os   = require('os');
+const { spawn } = require('child_process');
+
+const IS_WIN     = process.platform === 'win32';
+const AHUB_DIR    = path.join(os.homedir(), '.agenthub');
+const META_FILE  = path.join(AHUB_DIR, 'sessions.json');
+
+function loadMeta() {
+  try { return JSON.parse(fs.readFileSync(META_FILE, 'utf8')); }
+  catch (_) { return []; }
+}
+
+function findSession(idOrName) {
+  const metas = loadMeta();
+  return metas.find(s => s.sessionId === idOrName || s.name === idOrName
+    || s.sessionId.startsWith(idOrName));
+}
+
+function getSocketPath(meta) {
+  if (IS_WIN) return `\\\\.\\pipe\\ahub-${meta.sessionId}`;
+  return meta.socketPath || path.join(AHUB_DIR, 'sockets', `${meta.sessionId}.sock`);
+}
+
+function socketExists(sockPath) {
+  if (IS_WIN) return true; // named pipe 无法用 existsSync 检查
+  return fs.existsSync(sockPath);
+}
+
+function listSessions() {
+  const metas = loadMeta();
+  if (metas.length === 0) { console.log('No sessions found.'); return; }
+
+  const now = Date.now();
+  console.log('\n  Sessions\n');
+  for (const s of metas) {
+    const status   = s.alive ? '\x1b[32m● live\x1b[0m' : '\x1b[90m○ dead\x1b[0m';
+    const elapsed  = formatAge(now - (s.lastActiveAt || s.createdAt));
+    const sockPath = getSocketPath(s);
+    const sockOk   = socketExists(sockPath);
+    const sockInfo = sockOk ? '\x1b[36m[socket ok]\x1b[0m' : '\x1b[90m[no socket]\x1b[0m';
+    console.log(`  ${status}  \x1b[1m${s.name}\x1b[0m`);
+    console.log(`       id:  ${s.sessionId}`);
+    console.log(`      cwd:  ${s.workingDir}`);
+    console.log(`     last:  ${elapsed} ago  ${sockInfo}`);
+    console.log(`      log:  ${s.logPath || '-'}`);
+    console.log();
+  }
+  console.log(`  Attach:  agenthub attach <name|id>`);
+  console.log(`  Log:     agenthub log <name|id>\n`);
+}
+
+function formatAge(ms) {
+  if (ms < 60000)   return Math.floor(ms / 1000) + 's';
+  if (ms < 3600000) return Math.floor(ms / 60000) + 'm';
+  if (ms < 86400000) return Math.floor(ms / 3600000) + 'h';
+  return Math.floor(ms / 86400000) + 'd';
+}
+
+function attachCmd(idOrName) {
+  let session;
+
+  if (!idOrName) {
+    const metas = loadMeta();
+    const alive  = metas.filter(s => s.alive);
+    if (alive.length === 1) {
+      session = alive[0];
+    } else if (alive.length === 0) {
+      console.error('No alive sessions. Start one in the browser first.');
+      process.exit(1);
+    } else {
+      console.error('Multiple alive sessions. Specify name or id:\n');
+      for (const s of alive) console.error(`  agenthub attach ${s.name}  (${s.sessionId.slice(0, 8)})`);
+      process.exit(1);
+    }
+  } else {
+    session = findSession(idOrName);
+    if (!session) { console.error(`Session not found: ${idOrName}`); process.exit(1); }
+    if (!session.alive) {
+      console.error(`Session "${session.name}" is dead. Use 'agenthub log' to view output.`);
+      process.exit(1);
+    }
+  }
+
+  const sockPath = getSocketPath(session);
+  if (!IS_WIN && !fs.existsSync(sockPath)) {
+    console.error(`Socket not found: ${sockPath}\nMake sure the agenthub server is running.`);
+    process.exit(1);
+  }
+
+  console.log(`\x1b[36mAttaching to \x1b[1m${session.name}\x1b[0m\x1b[36m (${session.sessionId.slice(0, 8)})\x1b[0m`);
+  console.log(`\x1b[90mDetach: Ctrl+] — will NOT kill the session\x1b[0m\n`);
+
+  const socket = net.createConnection(sockPath);
+
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+  process.stdin.resume();
+
+  function sendResize() {
+    const cols = process.stdout.columns || 80;
+    const rows = process.stdout.rows    || 24;
+    try { socket.write(`\x00RESIZE:${cols}:${rows}\n`); } catch (_) {}
+  }
+
+  // 拦截 Ctrl+] (0x1d) 作为逃逸键，不传给 PTY
+  const onStdinData = (chunk) => {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    for (let i = 0; i < bytes.length; i++) {
+      if (bytes[i] === 0x1d) { doDetach(); return; }
+    }
+    try { socket.write(bytes); } catch (_) {}
+  };
+
+  socket.on('connect', () => {
+    sendResize();
+    process.stdout.on('resize', sendResize);
+    process.stdin.on('data', onStdinData);
+    socket.pipe(process.stdout);
+  });
+
+  function doDetach() {
+    process.stdin.removeListener('data', onStdinData);
+    try { socket.unpipe(process.stdout); socket.destroy(); } catch (_) {}
+    process.stdout.removeListener('resize', sendResize);
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+  }
+
+  socket.on('error', err => {
+    doDetach();
+    console.error('\r\nSocket error:', err.message);
+    process.exit(1);
+  });
+
+  socket.on('close', () => {
+    doDetach();
+    console.log('\r\n\x1b[36m[Detached]\x1b[0m');
+    process.exit(0);
+  });
+
+  // Ctrl+C 仍发给 PTY（让 claude 自己处理中断），不用来断开
+}
+
+function logCmd(idOrName) {
+  const session = findSession(idOrName);
+  if (!session) { console.error(`Session not found: ${idOrName}`); process.exit(1); }
+  if (!session.logPath || !fs.existsSync(session.logPath)) {
+    console.error(`Log file not found: ${session.logPath}`);
+    process.exit(1);
+  }
+  console.log(`\x1b[36mTailing log for \x1b[1m${session.name}\x1b[0m\x1b[36m → ${session.logPath}\x1b[0m`);
+  console.log(`\x1b[90mCtrl+C to stop\x1b[0m\n`);
+
+  if (IS_WIN) {
+    // Windows: PowerShell Get-Content -Wait
+    const ps = spawn('powershell.exe', ['-Command', `Get-Content -Path "${session.logPath}" -Wait -Tail 50`], {
+      stdio: ['ignore', 'inherit', 'inherit'],
+    });
+    process.on('SIGINT', () => { ps.kill(); process.exit(0); });
+  } else {
+    const tail = spawn('tail', ['-f', session.logPath], { stdio: ['ignore', 'inherit', 'inherit'] });
+    process.on('SIGINT', () => { tail.kill(); process.exit(0); });
+  }
+}
+
+// ── CLI entry ─────────────────────────────────────────────────────────────────
+const [,, cmd, arg] = process.argv;
+
+const C = { r:'\x1b[0m', b:'\x1b[1m', d:'\x1b[2m', c:'\x1b[36m', g:'\x1b[32m', y:'\x1b[33m', gray:'\x1b[90m' };
+
+function printHelp() {
+  console.log(`
+  ${C.b}${C.c}agenthub${C.r} — AgentHub CLI
+
+  ${C.b}服务管理${C.r}
+    ${C.c}agenthub start${C.r}            启动服务（守护进程，崩溃自动重启）
+    ${C.c}agenthub stop${C.r}             停止服务
+    ${C.c}agenthub restart${C.r}          重启服务（断 WS/PTY）
+    ${C.c}agenthub reload${C.r}           热重载业务层（WS/PTY 不中断）
+    ${C.c}agenthub status${C.r}           查看服务运行状态
+    ${C.c}agenthub update${C.r}           更新到最新版本（git pull + 重新构建）
+
+  ${C.b}会话管理${C.r}
+    ${C.c}agenthub${C.r}                  进入 TUI 界面（等同于 ahub-tui）
+    ${C.c}agenthub attach${C.r}           进入 TUI 界面
+    ${C.c}agenthub ls${C.r}               列出所有会话
+    ${C.c}agenthub log <name|id>${C.r}     实时查看会话日志（tail -f）
+
+  ${C.b}交互式界面${C.r}
+    ${C.c}ahub-tui${C.r}                   本地交互式 TUI（无需登录，推荐）
+
+  ${C.b}Web 界面${C.r}
+    启动服务后浏览器访问 ${C.c}http://<IP>:<PORT>${C.r}
+
+  ${C.b}断开会话${C.r}
+    在会话内按 ${C.b}Ctrl+]${C.r} 断开回菜单，不终止 Claude 进程
+  `);
+}
+
+switch (cmd) {
+  case '-h':
+  case '--help':
+  case 'help':
+    printHelp();
+    break;
+  case 'ls':
+  case 'list':
+    listSessions();
+    break;
+  case 'attach':
+  case 'a':
+  case undefined: {
+    // attach 和无参数直接进 ahub-tui，有 <name> 则透传直接接入会话
+    const tuiPath = require('path').join(__dirname, 'ahub-tui');
+    const tuiArgs = arg ? [tuiPath, '--attach', arg] : [tuiPath];
+    try {
+      require('child_process').execFileSync(
+        process.execPath, tuiArgs,
+        { stdio: 'inherit' }
+      );
+    } catch (e) { process.exit(e.status || 0); }
+    break;
+  }
+  case 'log':
+  case 'l':
+    if (!arg) { console.error('Usage: agenthub log <name|id>'); process.exit(1); }
+    logCmd(arg);
+    break;
+  case 'start':
+  case 'stop':
+  case 'restart':
+  case 'reload':
+  case 'status':
+    // 转发给 ahub-server
+    try {
+      require('child_process').execFileSync(
+        path.join(__dirname, 'ahub-server'), [cmd],
+        { stdio: 'inherit' }
+      );
+    } catch (e) { process.exit(e.status || 1); }
+    break;
+  case 'update': {
+    const { execSync } = require('child_process');
+    const dir = __dirname;
+    const C = { reset:'\x1b[0m', cyan:'\x1b[36m', green:'\x1b[32m', red:'\x1b[31m', gray:'\x1b[90m', yellow:'\x1b[33m' };
+    const ok   = (s) => console.log(`  ${C.green}✓${C.reset} ${s}`);
+    const warn = (s) => console.log(`  ${C.yellow}⚠${C.reset} ${s}`);
+    const err  = (s) => { console.error(`  ${C.red}✗${C.reset} ${s}`); process.exit(1); };
+    const run  = (cmd, opts) => execSync(cmd, { cwd: dir, stdio: 'inherit', ...opts });
+    const pipe = (cmd, opts) => execSync(cmd, { cwd: dir, stdio: 'pipe', ...opts });
+    const envFile = path.join(dir, '.env');
+
+    function readEnv() {
+      const out = {};
+      try {
+        for (const line of fs.readFileSync(envFile, 'utf8').split(/\r?\n/)) {
+          const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+          if (m) out[m[1]] = m[2];
+        }
+      } catch (_) {}
+      return out;
+    }
+
+    function detectBin(name) {
+      try { return pipe(`command -v ${name} 2>/dev/null || true`).toString().trim(); }
+      catch (_) { return ''; }
+    }
+
+    function prompt(question, def = '') {
+      if (!process.stdin.isTTY || !process.stdout.isTTY) return def;
+      const suffix = def ? ` [${def}]` : '';
+      process.stdout.write(`  ${question}${suffix}: `);
+      const buf = Buffer.alloc(2048);
+      try {
+        const n = fs.readSync(0, buf, 0, buf.length, null);
+        return (buf.slice(0, n).toString('utf8').trim() || def);
+      } catch (_) {
+        return def;
+      }
+    }
+
+    function writeEnv(values) {
+      const existing = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8').split(/\r?\n/) : [];
+      const keys = new Set(Object.keys(values));
+      const lines = existing.map(line => {
+        const m = line.match(/^([A-Z_][A-Z0-9_]*)=/);
+        if (m && keys.has(m[1])) {
+          const key = m[1];
+          keys.delete(key);
+          return `${key}=${values[key] || ''}`;
+        }
+        return line;
+      }).filter((line, idx, arr) => line || idx < arr.length - 1);
+      for (const key of keys) lines.push(`${key}=${values[key] || ''}`);
+      fs.writeFileSync(envFile, lines.join('\n') + '\n');
+      try { fs.chmodSync(envFile, 0o600); } catch (_) {}
+    }
+
+    function migrateEnv() {
+      const env = readEnv();
+      const patch = {};
+      if (!('AHUB_AGENT' in env)) patch.AHUB_AGENT = env.CLAUDE_BIN ? 'claude' : 'codex';
+      if (!('CLAUDE_BIN' in env)) patch.CLAUDE_BIN = detectBin('claude');
+      if (!('CODEX_BIN' in env)) patch.CODEX_BIN = detectBin('codex');
+      if (!('CLAUDE_PROXY' in env)) patch.CLAUDE_PROXY = prompt('Claude Code 代理 URL（示例 http://127.0.0.1:7890，可留空）', '');
+      if (!('CODEX_PROXY' in env)) patch.CODEX_PROXY = prompt('Codex 代理 URL（示例 http://127.0.0.1:7890，可留空）', '');
+      if (!('AGENT_NO_PROXY' in env)) patch.AGENT_NO_PROXY = process.env.AGENT_NO_PROXY || 'localhost,127.0.0.1,::1';
+      if (Object.keys(patch).length) {
+        writeEnv(patch);
+        ok('.env 已补充 Agent/Codex 兼容配置');
+      }
+    }
+
+    console.log(`\n  ${C.cyan}AgentHub 更新${C.reset}\n`);
+
+    // 1. 记录更新前的关键文件 hash（server/ + 脚本文件），判断是否需要重启
+    const RESTART_PATHS = 'server/ ahub-server agenthub ahub-tui';
+    let serverHashBefore = '';
+    try { serverHashBefore = pipe('git ls-files -s ' + RESTART_PATHS).toString(); } catch (_) {}
+
+    // 2. git pull（先还原 package-lock.json 避免 rebase 冲突）
+    try { pipe('git checkout -- client/package-lock.json server/package-lock.json 2>/dev/null || true'); } catch (_) {}
+    try { run('git pull --rebase origin main'); ok('代码已更新'); }
+    catch (_) { err('git pull 失败，请检查网络或手动执行: git pull --rebase origin main'); }
+
+    // 3. 判断是否有需要重启的文件变更
+    let serverHashAfter = '';
+    try { serverHashAfter = pipe('git ls-files -s ' + RESTART_PATHS).toString(); } catch (_) {}
+    const serverChanged = serverHashBefore !== serverHashAfter;
+
+    // 4. 服务端依赖（仅 server/ 有变化时安装）
+    if (serverChanged) {
+      process.stdout.write('  安装服务端依赖...');
+      try {
+        execSync('npm install --loglevel=error', { cwd: path.join(dir, 'server'), stdio: 'pipe' });
+        console.log(' ✓');
+      } catch (e) { console.log(''); err('npm install (server) 失败: ' + e.message); }
+    }
+
+    // 5. 前端构建
+    process.stdout.write('  构建前端...');
+    try {
+      execSync('npm install --loglevel=error', { cwd: path.join(dir, 'client'), stdio: 'pipe' });
+      execSync('npm run build', { cwd: path.join(dir, 'client'), stdio: 'pipe' });
+      console.log(' ✓');
+    } catch (e) { console.log(''); err('前端构建失败: ' + e.message); }
+
+    // 5.1. 旧版本升级补齐 Codex / Agent 代理配置
+    migrateEnv();
+
+    // 6. 根据变更类型决定后续动作
+    let serviceRunning = false;
+    try { execSync(path.join(dir, 'ahub-server') + ' status', { stdio: 'pipe' }); serviceRunning = true; } catch (_) {}
+
+    if (serverChanged) {
+      // server/ 或脚本有变更，必须完整重启
+      if (serviceRunning) {
+        warn('服务端有更新，正在重启服务...');
+        try {
+          execSync(path.join(dir, 'ahub-server') + ' restart', { stdio: 'inherit' });
+          ok('服务已重启，刷新浏览器即可 🎉');
+        } catch (_) {
+          warn('自动重启失败，请手动执行: agenthub restart');
+        }
+      } else {
+        ok('更新完成。启动服务: agenthub start');
+      }
+    } else if (serviceRunning) {
+      // 仅前端变更，热重载即可
+      try {
+        execSync(path.join(dir, 'ahub-server') + ' reload', { stdio: 'pipe' });
+        ok('服务已热重载，刷新浏览器即可 🎉');
+      } catch (_) {
+        ok('前端已更新，请刷新浏览器（或执行 agenthub reload）');
+      }
+    } else {
+      ok('更新完成。启动服务: agenthub start');
+    }
+    break;
+  }
+  default:
+    console.error(`Unknown command: ${cmd}`);
+    console.error('Usage: agenthub [ls | attach [name|id] | log <name|id> | start | stop | restart | status | update]');
+    process.exit(1);
+}

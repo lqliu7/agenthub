@@ -1,0 +1,214 @@
+#!/bin/bash
+# ahub-server: 启动并守护 AgentHub 服务
+# 用法: ahub-server [start|stop|restart|reload|status|log]
+#
+#   start   — 启动 proxy.js（长期常驻，内部管理 app.js 子进程）
+#   stop    — 完全停止（WS 断开，PTY 终止）
+#   restart — stop + start
+#   reload  — 热重载 app.js（WS/PTY 不中断，发送 SIGUSR2 给 proxy）
+#   status  — 查看状态
+#   log     — 实时日志
+
+AHUB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVER_DIR="$AHUB_DIR/server"
+PID_FILE="/tmp/ahub-server.pid"
+LOG_FILE="/tmp/ahub.log"
+LOCK_FILE="$HOME/.agenthub/server.lock"
+
+# 优先从 .env 加载配置
+if [[ -f "$AHUB_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source <(grep -E '^[A-Z_]+=.' "$AHUB_DIR/.env")
+  set +a
+fi
+
+PORT="${PORT:-8310}"
+RC_USER="${RC_USER:-admin}"
+RC_PASS="${RC_PASS:-changeme}"
+CLAUDE_BIN="${CLAUDE_BIN:-}"
+CODEX_BIN="${CODEX_BIN:-}"
+AHUB_AGENT="${AHUB_AGENT:-claude}"
+CLAUDE_PROXY="${CLAUDE_PROXY:-}"
+CODEX_PROXY="${CODEX_PROXY:-}"
+CLAUDE_NO_PROXY="${CLAUDE_NO_PROXY:-}"
+CODEX_NO_PROXY="${CODEX_NO_PROXY:-}"
+AGENT_NO_PROXY="${AGENT_NO_PROXY:-}"
+IS_SANDBOX="${IS_SANDBOX:-}"
+
+# 自动检测 node 路径
+NODE="$(command -v node 2>/dev/null || echo node)"
+
+cmd="${1:-start}"
+
+is_pid_alive() {
+  [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null
+}
+
+lock_pid() {
+  [ -f "$LOCK_FILE" ] || return 0
+  node -e "try{process.stdout.write(String(JSON.parse(require('fs').readFileSync('$LOCK_FILE','utf8')).pid||''))}catch(e){}" 2>/dev/null
+}
+
+is_running() {
+  local lp
+  lp="$(lock_pid)"
+  if [ -n "$lp" ] && is_pid_alive "$lp"; then
+    return 0
+  fi
+  pgrep -f "$SERVER_DIR/proxy\.js" >/dev/null 2>&1
+}
+
+watchdog_running() {
+  [ -f "$PID_FILE" ] && is_pid_alive "$(cat "$PID_FILE" 2>/dev/null)"
+}
+
+port_owner_lines() {
+  command -v netstat >/dev/null 2>&1 || return 0
+  netstat -ltnp 2>/dev/null | awk -v port=":$PORT" '$4 ~ port "$" { print }'
+}
+
+port_in_use() {
+  [ -n "$(port_owner_lines)" ]
+}
+
+do_start() {
+  if is_running; then
+    echo "Already running. Log: $LOG_FILE"
+    return 0
+  fi
+  if watchdog_running; then
+    echo "Cleaning stale watchdog (pid $(cat "$PID_FILE"))..."
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    rm -f "$PID_FILE"
+    sleep 1
+  fi
+  if port_in_use; then
+    echo "Port $PORT is already in use:"
+    port_owner_lines
+    echo "Change PORT in $AHUB_DIR/.env or stop the process using this port."
+    return 1
+  fi
+
+  echo "Starting on port $PORT..."
+
+  # Watchdog loop 独立于当前 shell，避免远程执行器关闭父进程时带走服务。
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$AHUB_DIR/ahub-server" _watchdog >> "$LOG_FILE" 2>&1 &
+  else
+    nohup "$AHUB_DIR/ahub-server" _watchdog >> "$LOG_FILE" 2>&1 &
+  fi
+  WATCHDOG_PID=$!
+  echo $WATCHDOG_PID > "$PID_FILE"
+  echo "Started. Log: $LOG_FILE"
+}
+
+do_watchdog() {
+  while true; do
+    export RC_USER RC_PASS PORT
+    export AHUB_AGENT
+    [[ -n "$CLAUDE_BIN"   ]] && export CLAUDE_BIN
+    [[ -n "$CODEX_BIN"    ]] && export CODEX_BIN
+    [[ -n "$CLAUDE_PROXY" ]] && export CLAUDE_PROXY
+    [[ -n "$CODEX_PROXY"  ]] && export CODEX_PROXY
+    [[ -n "$CLAUDE_NO_PROXY" ]] && export CLAUDE_NO_PROXY
+    [[ -n "$CODEX_NO_PROXY"  ]] && export CODEX_NO_PROXY
+    [[ -n "$AGENT_NO_PROXY"  ]] && export AGENT_NO_PROXY
+    [[ -n "$IS_SANDBOX"   ]] && export IS_SANDBOX
+    "$NODE" "$SERVER_DIR/proxy.js"
+    EXIT=$?
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] exited (code $EXIT), restarting in 3s..."
+    sleep 3
+  done
+}
+
+do_stop() {
+  if ! is_running && ! watchdog_running; then
+    echo "Not running."
+    rm -f "$PID_FILE"
+  else
+    PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+    LP="$(lock_pid)"
+    echo "Stopping..."
+    [ -n "$PID" ] && pkill -P "$PID" 2>/dev/null
+    [ -n "$PID" ] && kill "$PID" 2>/dev/null
+    [ -n "$LP" ] && pkill -P "$LP" 2>/dev/null
+    [ -n "$LP" ] && kill "$LP" 2>/dev/null
+    rm -f "$PID_FILE"
+    echo "Stopped."
+  fi
+  # 兜底：清理当前项目路径下残留的 watchdog / proxy / app 进程。
+  pkill -f "$AHUB_DIR/ahub-server _watchdog" 2>/dev/null || true
+  pkill -f "$SERVER_DIR/proxy\.js" 2>/dev/null || true
+  pkill -f "$SERVER_DIR/index\.js" 2>/dev/null || true
+  pkill -f "$SERVER_DIR/app\.js"   2>/dev/null || true
+  # 等进程真正退出，避免 restart 时端口还被占用
+  sleep 1
+  rm -f "$HOME/.agenthub/local.token" "$HOME/.agenthub/server.lock"
+}
+
+do_reload() {
+  # 热重载：只重启 app.js，WS/PTY 不中断
+  # proxy.js 的 PID 存在 lock 文件里（由 proxy.js 写入）
+  LOCK_FILE="$HOME/.agenthub/server.lock"
+  if [[ ! -f "$LOCK_FILE" ]]; then
+    echo "Service is not running. Use: ahub-server start"
+    exit 1
+  fi
+  PROXY_PID="$(node -e "try{process.stdout.write(String(JSON.parse(require('fs').readFileSync('$LOCK_FILE'))?.pid||''))}catch(e){}" 2>/dev/null)"
+  if [[ -z "$PROXY_PID" ]]; then
+    echo "Could not read service PID. Try: ahub-server restart"
+    exit 1
+  fi
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "Service is not running. Use: ahub-server start"
+    exit 1
+  fi
+  kill -SIGUSR2 "$PROXY_PID"
+  echo "Reloading... (WS connections and agent sessions unaffected)"
+  echo "Refresh browser when done."
+}
+
+do_status() {
+  if is_running; then
+    PID="$(cat "$PID_FILE" 2>/dev/null || lock_pid)"
+    echo "Running on port $PORT (pid $PID). Log: $LOG_FILE"
+    pgrep -a node 2>/dev/null | grep -E "proxy\.js|index\.js" | head -5
+  elif watchdog_running; then
+    echo "Watchdog is running, but proxy is not active. Log: $LOG_FILE"
+    if port_in_use; then
+      echo "Port $PORT is occupied by:"
+      port_owner_lines
+    fi
+  elif port_in_use; then
+    echo "Not running. Port $PORT is occupied by:"
+    port_owner_lines
+  else
+    echo "Not running."
+  fi
+}
+
+do_log() {
+  tail -f "$LOG_FILE"
+}
+
+case "$cmd" in
+  start)   do_start   ;;
+  stop)    do_stop    ;;
+  restart) do_stop; sleep 1; do_start ;;
+  reload)  do_reload  ;;
+  status)  do_status  ;;
+  log)     do_log     ;;
+  _watchdog) do_watchdog ;;
+  *)
+    echo "Usage: ahub-server [start|stop|restart|reload|status|log]"
+    echo ""
+    echo "  start   — 启动服务（proxy.js 常驻，管理 app.js 子进程）"
+    echo "  stop    — 完全停止服务"
+    echo "  restart — 完全重启（WS 断开，PTY 终止）"
+    echo "  reload  — 热重载 app.js（WS/PTY 不中断）"
+    echo "  status  — 查看运行状态"
+    echo "  log     — 实时查看日志"
+    exit 1
+    ;;
+esac

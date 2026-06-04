@@ -1,0 +1,246 @@
+const fs   = require('fs');
+const path = require('path');
+const os   = require('os');
+
+// ── 安全根目录白名单 ──────────────────────────────────────────────────────────
+const DEFAULT_ROOTS = [path.parse(os.homedir()).root];
+
+function getAllowedRoots() {
+  const extra = (process.env.FS_ROOTS || '').split(':').filter(Boolean);
+  return [...DEFAULT_ROOTS, ...extra].map(root => path.resolve(root));
+}
+
+function isAllowedPath(resolved, root) {
+  const rootDir = path.parse(root).root;
+  if (root === rootDir) return resolved.startsWith(rootDir);
+  return resolved === root || resolved.startsWith(root + path.sep);
+}
+
+/**
+ * 路径安全检查：解析绝对路径并验证在白名单根目录下
+ * @param {string} reqPath  请求路径（可含 ~）
+ * @returns {string}        解析后的安全绝对路径
+ * @throws {Error}          路径不安全时抛出
+ */
+function resolveSafePath(reqPath) {
+  if (!reqPath) reqPath = path.parse(os.homedir()).root;
+  // 展开 ~ 为 homedir
+  if (reqPath === '~' || reqPath.startsWith('~/')) {
+    reqPath = os.homedir() + reqPath.slice(1);
+  }
+  const resolved = path.resolve(reqPath);
+  const allowed = getAllowedRoots();
+  const ok = allowed.some(root => isAllowedPath(resolved, root));
+  if (!ok) throw new Error(`Access denied: ${resolved}`);
+  return resolved;
+}
+
+// ── 文件类型映射 ──────────────────────────────────────────────────────────────
+const TEXT_EXTS = new Set([
+  '.md', '.txt', '.js', '.ts', '.jsx', '.tsx', '.vue', '.json', '.sh',
+  '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf', '.env', '.py',
+  '.rb', '.go', '.rs', '.c', '.cpp', '.h', '.hpp', '.java', '.kt',
+  '.css', '.scss', '.less', '.html', '.htm', '.xml', '.svg', '.csv',
+  '.log', '.diff', '.patch', '.sql', '.graphql', '.proto', '.tf',
+  '.dockerfile', '.makefile', '.gitignore', '.gitattributes',
+]);
+
+const IMAGE_EXTS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico',
+]);
+
+// SVG 作为文本而非图片（可直接阅读源码）
+const SVG_EXT = '.svg';
+
+function getFileKind(ext) {
+  const e = ext.toLowerCase();
+  if (e === SVG_EXT) return 'text';
+  if (TEXT_EXTS.has(e))  return 'text';
+  if (IMAGE_EXTS.has(e)) return 'image';
+  return 'unsupported';
+}
+
+/**
+ * 列目录内容
+ * @param {string}  reqPath     请求路径
+ * @param {boolean} showHidden  是否显示隐藏文件
+ * @returns {{ path: string, entries: Array }}
+ */
+function listDir(reqPath, showHidden = false) {
+  const safePath = resolveSafePath(reqPath);
+  const stat = fs.statSync(safePath);
+  if (!stat.isDirectory()) throw new Error('Not a directory');
+
+  const names = fs.readdirSync(safePath);
+  const entries = [];
+
+  for (const name of names) {
+    if (!showHidden && name.startsWith('.')) continue;
+    try {
+      const full = path.join(safePath, name);
+      const s    = fs.statSync(full);
+      const ext  = path.extname(name).toLowerCase();
+      entries.push({
+        name,
+        type: s.isDirectory() ? 'dir' : 'file',
+        size: s.isDirectory() ? null : s.size,
+        mtime: s.mtimeMs,
+        ext: s.isDirectory() ? '' : ext,
+      });
+    } catch (_) {
+      // 无权限的条目跳过
+    }
+  }
+
+  // 目录在前，文件在后，各自按名称字母排序
+  entries.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+    return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+  });
+
+  return { path: safePath, entries };
+}
+
+const TEXT_MAX_BYTES  = 100 * 1024;  // 100 KB
+const IMAGE_MAX_BYTES = 2  * 1024 * 1024;  // 2 MB
+
+/**
+ * 读取文件预览内容
+ * @param {string} reqPath
+ * @param {number} maxBytes  文本最大字节数（默认 100KB）
+ * @returns {{ path, type, content?, dataUrl?, truncated, size }}
+ */
+function readFilePreview(reqPath, maxBytes = TEXT_MAX_BYTES) {
+  const safePath = resolveSafePath(reqPath);
+  const stat = fs.statSync(safePath);
+  if (stat.isDirectory()) throw new Error('Is a directory');
+
+  const ext  = path.extname(safePath).toLowerCase();
+  const kind = getFileKind(ext);
+  const size = stat.size;
+
+  if (kind === 'unsupported') {
+    return { path: safePath, type: 'unsupported', size };
+  }
+
+  if (kind === 'image') {
+    if (size > IMAGE_MAX_BYTES) {
+      return { path: safePath, type: 'image_too_large', size };
+    }
+    const buf = fs.readFileSync(safePath);
+    const mime = ext === '.svg' ? 'image/svg+xml'
+               : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+               : ext === '.gif' ? 'image/gif'
+               : ext === '.webp' ? 'image/webp'
+               : ext === '.bmp' ? 'image/bmp'
+               : ext === '.ico' ? 'image/x-icon'
+               : 'image/png';
+    return {
+      path: safePath,
+      type: 'image',
+      dataUrl: `data:${mime};base64,${buf.toString('base64')}`,
+      size,
+      truncated: false,
+    };
+  }
+
+  // text
+  const limit = Math.min(maxBytes, TEXT_MAX_BYTES);
+  const buf = Buffer.allocUnsafe(Math.min(size, limit + 1));
+  const fd  = fs.openSync(safePath, 'r');
+  const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+  fs.closeSync(fd);
+
+  const truncated = bytesRead > limit;
+  const content   = buf.slice(0, truncated ? limit : bytesRead).toString('utf8');
+
+  return { path: safePath, type: 'text', content, truncated, size };
+}
+
+/**
+ * 获取文件/目录 stat 信息
+ */
+function statFile(reqPath) {
+  const safePath = resolveSafePath(reqPath);
+  const s  = fs.statSync(safePath);
+  const name = path.basename(safePath);
+  return {
+    path: safePath,
+    name,
+    type: s.isDirectory() ? 'dir' : 'file',
+    size: s.size,
+    mtime: s.mtimeMs,
+    mode: s.mode.toString(8),
+  };
+}
+
+function sanitizeFilename(name) {
+  const raw = String(name || 'upload.bin').split(/[\\/]/).pop();
+  const base = raw.replace(/[\x00-\x1f\x7f]/g, '_').trim();
+  return base && base !== '.' && base !== '..' ? base : 'upload.bin';
+}
+
+function sanitizeDirectoryName(name) {
+  const raw = String(name || '').trim();
+  if (!raw || raw === '.' || raw === '..') throw new Error('Invalid directory name');
+  if (raw.includes('/') || raw.includes('\\')) throw new Error('Directory name cannot contain path separators');
+  const safe = raw.replace(/[\x00-\x1f\x7f]/g, '_').trim();
+  if (!safe || safe === '.' || safe === '..') throw new Error('Invalid directory name');
+  return safe;
+}
+
+function uniqueFilePath(dir, filename) {
+  const parsed = path.parse(filename);
+  let candidate = path.join(dir, filename);
+  let index = 1;
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(dir, `${parsed.name}-${index}${parsed.ext}`);
+    index += 1;
+  }
+  return candidate;
+}
+
+function writeUploadedFile(reqDir, filename, buffer) {
+  const safeDir = resolveSafePath(reqDir);
+  const stat = fs.statSync(safeDir);
+  if (!stat.isDirectory()) throw new Error('Not a directory');
+
+  const safeName = sanitizeFilename(filename);
+  const filePath = uniqueFilePath(safeDir, safeName);
+  fs.writeFileSync(filePath, buffer);
+  return statFile(filePath);
+}
+
+function createDirectory(reqDir, dirname) {
+  const safeDir = resolveSafePath(reqDir);
+  const stat = fs.statSync(safeDir);
+  if (!stat.isDirectory()) throw new Error('Not a directory');
+
+  const safeName = sanitizeDirectoryName(dirname);
+  const dirPath = path.join(safeDir, safeName);
+  if (fs.existsSync(dirPath)) throw new Error('Directory already exists');
+  fs.mkdirSync(dirPath);
+  return statFile(dirPath);
+}
+
+function readDownloadFile(reqPath) {
+  const safePath = resolveSafePath(reqPath);
+  const stat = fs.statSync(safePath);
+  if (stat.isDirectory()) throw new Error('Is a directory');
+  return {
+    path: safePath,
+    name: path.basename(safePath),
+    size: stat.size,
+    content: fs.readFileSync(safePath),
+  };
+}
+
+module.exports = {
+  resolveSafePath,
+  listDir,
+  readFilePreview,
+  statFile,
+  createDirectory,
+  writeUploadedFile,
+  readDownloadFile,
+};
