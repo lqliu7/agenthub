@@ -72,17 +72,29 @@ mcp = FastMCP(
 
 # ── Auth Middleware ────────────────────────────────────────────────────────
 
-_current_caller = "anonymous"
+if AUTH_TOKENS:
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
 
+    class _AuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            auth = request.headers.get("authorization", "")
+            if auth.startswith("Bearer "):
+                caller = AUTH_TOKENS.get(auth[7:])
+                if caller:
+                    audit.set_caller(caller)
+                    return await call_next(request)
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
 
-def _authenticate_request(headers: dict) -> str:
-    """Validate Bearer token from request headers. Returns caller name or empty string."""
-    if not AUTH_TOKENS:
-        return "anonymous"
-    auth = headers.get("authorization", "")
-    if not auth.startswith("Bearer "):
-        return ""
-    return AUTH_TOKENS.get(auth[7:], "")
+    # Wrap sse_app to inject auth middleware
+    _original_sse_app = mcp.sse_app
+
+    def _authed_sse_app(*args, **kwargs):
+        app = _original_sse_app(*args, **kwargs)
+        app.add_middleware(_AuthMiddleware)
+        return app
+
+    mcp.sse_app = _authed_sse_app
 
 # ── Helper ──────────────────────────────────────────────────────────────────
 

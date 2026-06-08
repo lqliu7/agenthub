@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 _log_file = None
+_current_caller = "anonymous"
 
 
 def init(log_path: Optional[str] = None):
@@ -17,8 +18,16 @@ def init(log_path: Optional[str] = None):
         _log_file = open(log_path, "a")
 
 
-def log(tool: str, params: dict, result_status: str, caller: str = "unknown"):
+def set_caller(name: str):
+    """Set current caller identity (called by auth middleware)."""
+    global _current_caller
+    _current_caller = name
+
+
+def log(tool: str, params: dict, result_status: str, caller: str = ""):
     """Write one audit entry as JSON line."""
+    if not caller:
+        caller = _current_caller
     entry = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "caller": caller,

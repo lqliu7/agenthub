@@ -5,8 +5,8 @@ server:
   # Auth tokens — each entry is {token, name} for audit trail
   # install.sh auto-generates the first one on deploy
   tokens:
-    - token: "ahub-change-me"
-      name: "default"
+    - token: "nexus_ahub"
+      name: "nexus_ahub"
 
 security:
   audit_log: "/var/log/ahub-node/audit.jsonl"
