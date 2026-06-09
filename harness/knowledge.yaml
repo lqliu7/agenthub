@@ -1,0 +1,72 @@
+known_issues:
+  # L1 - Auto-fix (high confidence)
+  - pattern: "pip.*timed? out|ConnectTimeoutError|ConnectionError"
+    level: L1
+    solution: "switch_proxy"
+    confidence: high
+  - pattern: "No module named '(\\w+)'"
+    level: L1
+    solution: "pip_install_missing"
+    confidence: high
+  - pattern: "ModuleNotFoundError.*paddlex"
+    level: L1
+    solution: "pip install -U paddleocr[doc-parser]"
+    confidence: high
+  - pattern: "command not found: (\\w+)"
+    level: L1
+    solution: "apt_install_missing"
+    confidence: high
+  - pattern: "Could not find a version that satisfies"
+    level: L1
+    solution: "switch_pip_mirror"
+    confidence: high
+  - pattern: "huggingface_hub.*not found|hf.*command not found"
+    level: L1
+    solution: "pip install -U huggingface_hub[cli]"
+    confidence: high
+  - pattern: "Cannot reach HuggingFace|HfHubHTTPError|ConnectTimeout.*huggingface"
+    level: L1
+    solution: "switch_hf_proxy"
+    confidence: high
+  - pattern: "OSError.*We couldn't connect to"
+    level: L1
+    solution: "switch_hf_proxy"
+    confidence: high
+  - pattern: "Repository Not Found|EntryNotFoundError"
+    level: L2
+    solution: "check_model_name_or_use_local_path"
+    confidence: medium
+  - pattern: "/path/to/|your/model|placeholder"
+    level: L1
+    solution: "resolve_model_path_via_hf_download"
+    confidence: high
+
+  # L2 - Try fix (medium confidence)
+  - pattern: "CUDA.*capability.*7\\.5"
+    level: L2
+    solution: "mount_host_cuda_or_install_toolkit_13"
+    confidence: medium
+  - pattern: "OutOfMemoryError|CUDA out of memory"
+    level: L2
+    solution: "reduce_gpu_memory_utilization"
+    params: {reduce_factor: 0.5}
+    confidence: medium
+  - pattern: "version.*conflict|incompatible|Cannot install"
+    level: L2
+    solution: "try_alternative_version"
+    confidence: medium
+  - pattern: "Address already in use"
+    level: L2
+    solution: "kill_existing_process_on_port"
+    confidence: medium
+
+  # L3 - Stop and record
+  - pattern: "Segmentation fault|core dumped"
+    level: L3
+    solution: null
+  - pattern: "killed.*signal 9|OOM.*killed"
+    level: L3
+    solution: null
+  - pattern: "RuntimeError.*NCCL"
+    level: L3
+    solution: null

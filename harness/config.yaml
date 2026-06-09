@@ -1,0 +1,27 @@
+mcp:
+  url: "http://10.67.178.142:9100/sse"
+  token: "nexus_ahub"
+
+network:
+  proxies:
+    - name: "direct"
+      http: ""
+      https: ""
+    - name: "baidu_proxy"
+      http: "http://agent.baidu.com:8188"
+      https: "http://agent.baidu.com:8188"
+  pip_mirrors:
+    - "https://mirror.baidu.com/pypi/simple"
+    - "https://pypi.tuna.tsinghua.edu.cn/simple"
+    - "https://pypi.org/simple"
+  hf_mirrors:
+    - ""
+    - "https://hf-mirror.com"
+  download_retry: 3
+  strategy: "direct_first_then_proxy"
+  primary_proxy: "http://agent.baidu.com:8188"
+
+defaults:
+  timeout: 3600
+  service_start_timeout: 120
+  health_check_interval: 3

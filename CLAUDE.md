@@ -18,3 +18,16 @@ When operating remote machines (any node connected via MCP, e.g. node-A100-594):
 5. **Always call `system_info()` first** when beginning work on a remote node
 
 See `docs/remote-ops-rules.md` for full specification.
+
+## Test Harness 执行规则
+
+1. 执行提测任务时，必须先解析为 TestPlan 并通过 Pydantic 验证
+2. 必须通过 harness 编排引擎逐步执行，不能跳步骤
+3. 无对应 MCP 节点的硬件标记 skip，不模拟结果
+4. 环境创建后不自动删除，标记保留信息供再进入
+5. 网络问题按 `harness/config.yaml` 代理策略处理
+6. 未知错误不猜测解决方案，记录完整 stderr 并停止
+7. 服务类操作必须后台启动 + 健康检查确认就绪
+8. 遇到错误先查 `harness/knowledge.yaml`，匹配则按方案处理
+
+See `harness/skill.md` for full harness specification.
