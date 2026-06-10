@@ -31,8 +31,11 @@ class McpClient:
         """Synchronous wrapper around async MCP call."""
         import asyncio
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop and loop.is_running():
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as pool:
                     return pool.submit(asyncio.run, self._async_call(tool_name, args)).result()
