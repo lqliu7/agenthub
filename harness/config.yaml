@@ -1,6 +1,7 @@
 mcp:
   url: "http://10.67.178.142:9100/sse"
   token: "nexus_ahub"
+  sse_read_timeout: 1800
 
 network:
   proxies:

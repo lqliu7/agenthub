@@ -47,7 +47,7 @@ class McpClient:
         import json as _json
         from mcp.client.sse import sse_client
         from mcp import ClientSession
-        async with sse_client(self.url, headers=self._headers) as (read, write):
+        async with sse_client(self.url, headers=self._headers, sse_read_timeout=CONFIG.get("mcp", {}).get("sse_read_timeout", 300)) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(tool_name, args)
