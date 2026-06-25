@@ -23,12 +23,26 @@ See `docs/remote-ops-rules.md` for full specification.
 
 **适用范围**：凡是需要在远端机器上运行代码/命令的任务，包括但不限于：提测验证、issue 复现、模型推理/训练、性能测试、数据分析、环境验证。只要涉及 MCP 远端执行，就必须走 harness 流程。不存在"这个任务比较简单所以直接操作"的例外。
 
-**执行前自检（agent 在首次调用 MCP container_exec/shell_exec 前必须完成）**：
-- [ ] TestPlan 是否已生成并获得用户 CLI 确认？
-- [ ] AcceptanceSpec 是否已生成并冻结？
-- [ ] HarnessState 是否已初始化（stage list + status tracking）？
-任一项为否时，**禁止调用 container_exec / shell_exec**。违反此条视为 L3 错误——已产出的结果全部作废，必须从头重新执行 harness 流程。
-agent 不得以"快速分析"、"先探索一下"、"简单验证"等理由绕过此自检。探索性操作同样必须在 TestPlan stage 中声明。
+**执行前门禁（硬约束 — 必须产出可见 artifact 才能继续）**：
+
+AcceptanceSpec 获得用户确认后，agent 必须在**紧接着的下一条回复**中完成以下初始化，且该回复中**禁止包含任何 MCP container_exec / shell_exec 调用**：
+
+1. 创建 `outputs/` 目录及每个 stage 的子目录
+2. 写入 `outputs/acceptance_spec.yaml`（冻结版）
+3. 输出 HarnessState 代码块，格式**必须以下面这行开头**（逐字匹配）：
+   ```
+   # === HarnessState Initialized ===
+   ```
+   内容包含：task、execution_mode、所有 stages（id + status: pending）、current_stage: null、progress_log 路径。
+
+**门禁判定规则**：
+- 当前会话中如果不存在已输出的 `# === HarnessState Initialized ===` 标记，则后续任何 `container_exec` / `shell_exec` / `shell_exec`（MCP）调用均为 L3 违规
+- 输出该标记的回复中混入 MCP 执行调用，同样视为 L3 违规
+- L3 后果：已产出的结果全部作废，必须从头重新执行 harness 流程
+
+**禁止绕过**：agent 不得以"快速分析"、"先探索一下"、"简单验证"、"只是看一下环境"等理由跳过此门禁。探索性操作同样必须在 TestPlan stage 中声明并通过门禁后执行。
+
+**自查提示**：在生成任何 MCP 执行调用前，停下来确认——"我这个会话中是否已经输出过 `# === HarnessState Initialized ===`？"如果没有，立即停止并先完成初始化。
 
 1. 执行上述任何任务时，**必须先生成 TestPlan** 并通过 Pydantic 验证，用户 CLI 确认后才能开始执行。禁止跳过 TestPlan 直接调用 MCP 工具执行。
 1.1. **TestPlan 用户确认通过后，必须生成 AcceptanceSpec** 并向用户展示验收标准（required artifacts、metrics 阈值、exit_criteria、acceptance_mode）。用户 CLI 确认（[A]ccept/[E]dit/[R]egenerate）后冻结，作为后续 stage 门禁的硬约束。禁止跳过 AcceptanceSpec 确认直接执行。
