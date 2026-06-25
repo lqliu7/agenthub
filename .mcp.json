@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "node-A100-594": {
+      "type": "sse",
+      "url": "http://10.67.178.142:9100/sse",
+      "headers": {
+          "Authorization": "Bearer nexus_ahub"
+        }
+    }
+  }
+}

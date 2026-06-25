@@ -145,8 +145,11 @@ AgentHub 侧配置 `~/.claude/.mcp.json`：
 {
   "mcpServers": {
     "node-A100": {
-      "type": "sse",
-      "url": "http://<目标机器IP>:9100/sse"
+      "type": "http",
+      "url": "http://<目标机器IP>:9100/mcp",
+      "headers": {
+        "Authorization": "Bearer <token>"
+      }
     }
   }
 }

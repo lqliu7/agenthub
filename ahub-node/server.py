@@ -70,6 +70,8 @@ mcp = FastMCP(
     ),
 )
 
+DEFAULT_TRANSPORT = "streamable-http"
+
 # ── Auth Middleware ────────────────────────────────────────────────────────
 
 if AUTH_TOKENS:
@@ -86,15 +88,17 @@ if AUTH_TOKENS:
                     return await call_next(request)
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
-    # Wrap sse_app to inject auth middleware
-    _original_sse_app = mcp.sse_app
+    # Inject auth middleware into BOTH transports so a transport switch
+    # never silently disables authentication.
+    def _wrap(app_factory):
+        def _factory(*args, **kwargs):
+            app = app_factory(*args, **kwargs)
+            app.add_middleware(_AuthMiddleware)
+            return app
+        return _factory
 
-    def _authed_sse_app(*args, **kwargs):
-        app = _original_sse_app(*args, **kwargs)
-        app.add_middleware(_AuthMiddleware)
-        return app
-
-    mcp.sse_app = _authed_sse_app
+    mcp.sse_app = _wrap(mcp.sse_app)
+    mcp.streamable_http_app = _wrap(mcp.streamable_http_app)
 
 # ── Helper ──────────────────────────────────────────────────────────────────
 
@@ -450,8 +454,9 @@ if __name__ == "__main__":
     print(f"  Listening: http://{lan_ip}:{args.port}")
     print(f"  Tools: {len(mcp._tool_manager._tools)} registered")
     print(f"  Auth: {len(AUTH_TOKENS)} token(s) configured" if AUTH_TOKENS else "  Auth: OPEN (no tokens configured)")
-    print(f"\n  Claude Code settings.json:")
-    print(f'  "mcpServers": {{ "node": {{ "type": "sse", "url": "http://{lan_ip}:{args.port}/sse" }} }}')
+    print(f"\n  Claude Code .mcp.json:")
+    print(f'  "node": {{ "type": "http", "url": "http://{lan_ip}:{args.port}/mcp",')
+    print(f'             "headers": {{ "Authorization": "Bearer <token>" }} }}')
     print()
 
-    mcp.run(transport="sse")
+    mcp.run(transport=DEFAULT_TRANSPORT)
